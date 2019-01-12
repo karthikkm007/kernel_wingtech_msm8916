@@ -1609,6 +1609,8 @@ struct zs_compact_control {
 	 /* Starting object index within @s_page which used for live object
 	  * in the subpage. */
 	int index;
+	/* How many of objects were migrated */
+	int nr_migrated;
 };
 
 static int migrate_zspage(struct zs_pool *pool, struct size_class *class,
@@ -1651,7 +1653,8 @@ static int migrate_zspage(struct zs_pool *pool, struct size_class *class,
 		free_obj |= BIT(HANDLE_PIN_BIT);
 		record_obj(handle, free_obj);
 		unpin_tag(handle);
-		obj_free(class, used_obj);
+		obj_free(pool, class, used_obj);
+		cc->nr_migrated++;
 	}
 
 	/* Remember last position in this iteration */
@@ -1684,23 +1687,25 @@ static struct zspage *isolate_zspage(struct size_class *class, bool source)
 	return zspage;
 }
 
-/*
- * putback_zspage - add @zspage into right class's fullness list
- * @class: destination class
- * @zspage: target page
- *
- * Return @zspage's fullness_group
- */
-static enum fullness_group putback_zspage(struct size_class *class,
-			struct zspage *zspage)
+static void putback_zspage(struct zs_pool *pool, struct size_class *class,
+				struct page *first_page)
 {
 	enum fullness_group fullness;
 
-	fullness = get_fullness_group(class, zspage);
-	insert_zspage(class, zspage, fullness);
-	set_zspage_mapping(zspage, class->index, fullness);
+	BUG_ON(!is_first_page(first_page));
 
-	return fullness;
+	fullness = get_fullness_group(first_page);
+	insert_zspage(first_page, class, fullness);
+	set_zspage_mapping(first_page, class->index, fullness);
+
+	if (fullness == ZS_EMPTY) {
+		zs_stat_dec(class, OBJ_ALLOCATED, get_maxobj_per_zspage(
+			class->size, class->pages_per_zspage));
+		atomic_long_sub(class->pages_per_zspage,
+				&pool->pages_allocated);
+
+		free_zspage(first_page);
+	}
 }
 
 /*
@@ -1732,6 +1737,7 @@ static void __zs_compact(struct zs_pool *pool, struct size_class *class)
 	struct zspage *src_zspage;
 	struct zspage *dst_zspage = NULL;
 
+	cc.nr_migrated = 0;
 	spin_lock(&class->lock);
 	while ((src_zspage = isolate_zspage(class, true))) {
 
@@ -1757,15 +1763,8 @@ static void __zs_compact(struct zs_pool *pool, struct size_class *class)
 		if (dst_zspage == NULL)
 			break;
 
-		putback_zspage(class, dst_zspage);
-		if (putback_zspage(class, src_zspage) == ZS_EMPTY) {
-			zs_stat_dec(class, OBJ_ALLOCATED, get_maxobj_per_zspage(
-					class->size, class->pages_per_zspage));
-			atomic_long_sub(class->pages_per_zspage,
-					&pool->pages_allocated);
-			free_zspage(pool, src_zspage);
-			pool->stats.pages_compacted += class->pages_per_zspage;
-		}
+		putback_zspage(pool, class, dst_page);
+		putback_zspage(pool, class, src_page);
 		spin_unlock(&class->lock);
 		cond_resched();
 		spin_lock(&class->lock);
@@ -1773,6 +1772,8 @@ static void __zs_compact(struct zs_pool *pool, struct size_class *class)
 
 	if (src_zspage)
 		putback_zspage(class, src_zspage);
+
+	pool->stats.num_migrated += cc.nr_migrated;
 
 	spin_unlock(&class->lock);
 }
@@ -1791,7 +1792,7 @@ unsigned long zs_compact(struct zs_pool *pool)
 		__zs_compact(pool, class);
 	}
 
-	return pool->stats.pages_compacted;
+	return pool->stats.num_migrated;
 }
 EXPORT_SYMBOL_GPL(zs_compact);
 
